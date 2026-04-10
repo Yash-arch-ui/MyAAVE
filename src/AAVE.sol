@@ -12,6 +12,9 @@ contract AAVE is ERC20 {
     uint256 public totalBorrowed;
     uint256 public liquidityIndex;
     uint256 public lastIndexUpdate;
+    uint256 public borrowIndex;
+    uint256 public lastBorrowIndexUpdate;
+
 
     uint256 public constant OPTIMAL_UTILIZATION = 80e16;
     uint256 public constant BASE_RATE = 2e16;
@@ -22,8 +25,9 @@ contract AAVE is ERC20 {
     uint256 public constant LIQUIDATION_THRESHOLD = 50;
 
     mapping(address => uint256) public userBorrowings;
-    mapping(address => uint256) public lastUpdate;
     mapping(address => uint256) public scaledBalances;
+    mapping(address => uint256) public scaledDebt;
+
 
     event Supplied(address indexed user, uint256 amount);
     event Borrow(address indexed user, uint256 amount);
@@ -37,10 +41,21 @@ contract AAVE is ERC20 {
 
     constructor(address token) ERC20("TCoin", "aTC") {
         asset = token;
-        liquidityIndex = 1e27;
         lastIndexUpdate = block.timestamp;
+        borrowIndex=1e27;
+        liquidityIndex=1e27;
+        lastIndexUpdate= block.timestamp;
+        lastBorrowIndexUpdate= block.timestamp;
     }
+     function updateBorrowIndex() internal{
+        uint256 timeElapsed= block.timestamp - lastBorrowIndexUpdate;
+        if(timeElapsed == 0) return;
 
+        uint256 rate = getBorrowRate();
+        uint256 interest= (borrowIndex* rate * timeElapsed) / (365 days * 1e18);
+        borrowIndex += interest;
+        lastBorrowIndexUpdate = block.timestamp;
+     }
     function updateLiquidityIndex() internal {
         uint256 timeElapsed = block.timestamp - lastIndexUpdate;
         if (timeElapsed == 0) return;
@@ -51,16 +66,7 @@ contract AAVE is ERC20 {
         lastIndexUpdate = block.timestamp;
     }
 
-    function _accrueInterest(address user) internal {
-        uint256 timeElapsed = block.timestamp - lastUpdate[user];
-        if (timeElapsed > 0 && userBorrowings[user] > 0) {
-            uint256 borrowRate = getBorrowRate();
-            uint256 interest = (userBorrowings[user] * borrowRate * timeElapsed) / (365 days * 1e18);
-            userBorrowings[user] += interest;
-            totalBorrowed += interest;
-        }
-        lastUpdate[user] = block.timestamp;
-    }
+   
 
     function supply(uint256 amount) external {
         updateLiquidityIndex();
@@ -78,22 +84,23 @@ contract AAVE is ERC20 {
     }
 
     function borrow(uint256 amount) external {
+        updateLiquidityIndex();
+        updateBorrowIndex();
         require(amount > 0, "Amount must be > 0");
-
-        _accrueInterest(msg.sender);
 
         uint256 collateral = getActualBalance(msg.sender);
         require(collateral > 0, "No collateral");
 
-        uint256 existingBorrow = userBorrowings[msg.sender];
+        uint256 existingDebt = getActualDebt(msg.sender);
         uint256 maxBorrow = (collateral * LTV) / 100;
-        require(existingBorrow + amount <= maxBorrow, "Exceeds max borrow");
+        require(existingDebt + amount <= maxBorrow, "Exceeds max borrow");
 
         require(getHealthFactor(msg.sender) > 1e18, "Health factor too low");
         require(totalLiquidity - totalBorrowed >= amount, "Insufficient liquidity");
-
-        userBorrowings[msg.sender] += amount;
+        uint256 scaledAmount = (amount* 1e27)/ borrowIndex;
+        scaledDebt[msg.sender] += scaledAmount;
         totalBorrowed += amount;
+    
 
         IERC20(asset).safeTransfer(msg.sender, amount);
 
@@ -101,17 +108,16 @@ contract AAVE is ERC20 {
     }
 
     function repay(uint256 amount) external {
+        updateBorrowIndex();
         require(amount > 0, "Amount must be > 0");
-
-        _accrueInterest(msg.sender);
-
-        uint256 currentDebt = userBorrowings[msg.sender];
+        uint256 currentDebt = getActualDebt(msg.sender);
         require(currentDebt > 0, "No debt to repay");
 
         uint256 repayAmount = amount > currentDebt ? currentDebt : amount;
 
         IERC20(asset).safeTransferFrom(msg.sender, address(this), repayAmount);
-        userBorrowings[msg.sender] -= repayAmount;
+        uint256 scaledAmount= (repayAmount*1e27)/ borrowIndex;
+       scaledDebt[msg.sender] -= scaledAmount;
         totalBorrowed -= repayAmount;
         totalLiquidity += repayAmount;
 
@@ -123,10 +129,7 @@ contract AAVE is ERC20 {
 
         require(amount > 0, "Amount must be > 0");
         require(getActualBalance(msg.sender) >= amount, "Insufficient balance");
-
-        _accrueInterest(msg.sender);
-
-        uint256 currentDebt = userBorrowings[msg.sender];
+        uint256 currentDebt = getActualDebt(msg.sender);
         if (currentDebt > 0) {
             uint256 newCollateral = getActualBalance(msg.sender) - amount;
             require(
@@ -148,16 +151,17 @@ contract AAVE is ERC20 {
     
     function liquidate(address user, uint256 repayAmount) external {
         updateLiquidityIndex();
-        _accrueInterest(user);                                         
-
+        updateBorrowIndex();
         require(getHealthFactor(user) < 1e18, "HF must be below 1"); 
 
-        if (repayAmount > userBorrowings[user]) {
-            repayAmount = userBorrowings[user];                      
+        if (repayAmount > getActualDebt(user)) {
+            repayAmount = getActualDebt(user);                      
         }
 
         IERC20(asset).safeTransferFrom(msg.sender, address(this), repayAmount); 
-        userBorrowings[user] -= repayAmount;                     
+        uint256 scaledRepay= repayAmount*(1e27)/ borrowIndex;
+        scaledDebt[user] -= scaledRepay;
+
         totalBorrowed -= repayAmount;
         uint256 collateralToGive = (repayAmount * 110) / 100;         
         uint256 actualBalance = getActualBalance(user);               
@@ -190,16 +194,21 @@ contract AAVE is ERC20 {
         }
     }
 
-    // Takes an address so it can check ANY user (needed for liquidate, borrow, withdraw)
     function getHealthFactor(address user) public view returns (uint256) {
         uint256 collateral = getActualBalance(user);
-        uint256 debt = userBorrowings[user];
+        uint256 debt = getActualDebt(user);
         if (debt == 0) return type(uint256).max;
         return (collateral * LIQUIDATION_THRESHOLD * 1e18) / (debt * 100);
     }
 
-    // Takes an address so it can check ANY user's balance
+ 
     function getActualBalance(address user) public view returns (uint256) {
         return (scaledBalances[user] * liquidityIndex) / 1e27;
     }
+
+    function getActualDebt(address user) public view returns(uint256){
+        return (scaledDebt[user] * borrowIndex)/1e27;
+
+    }
 }
+
