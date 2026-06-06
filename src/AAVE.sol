@@ -3,6 +3,7 @@ pragma solidity ^0.8.19;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "./interface/IFlashLoanReceiver.sol";
 
 contract AAVE is ERC20 {
     using SafeERC20 for IERC20;
@@ -20,9 +21,10 @@ contract AAVE is ERC20 {
     uint256 public constant BASE_RATE = 2e16;
     uint256 public constant SLOPE1 = 5e16;
     uint256 public constant SLOPE2 = 20e16;
+    uint256 public constant FLASH_FEE= 0.09e18;
 
     uint256 public constant LTV = 75;
-    uint256 public constant LIQUIDATION_THRESHOLD = 50;
+    uint256 public constant LIQUIDATION_THRESHOLD = 80;
 
     mapping(address => uint256) public userBorrowings;
     mapping(address => uint256) public scaledBalances;
@@ -38,6 +40,7 @@ contract AAVE is ERC20 {
         uint256 repayAmount,
         uint256 collateralGiven
     );
+    event FlashLoan (address indexed receiver , uint256 amount , uint256 fee);
 
     constructor(address token) ERC20("TCoin", "aTC") {
         asset = token;
@@ -69,10 +72,9 @@ contract AAVE is ERC20 {
    
 
     function supply(uint256 amount) external {
+
         updateLiquidityIndex();
-
         require(amount > 0, "Amount must be > 0");
-
         IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
         totalLiquidity += amount;
 
@@ -130,6 +132,7 @@ contract AAVE is ERC20 {
         require(amount > 0, "Amount must be > 0");
         require(getActualBalance(msg.sender) >= amount, "Insufficient balance");
         uint256 currentDebt = getActualDebt(msg.sender);
+        
         if (currentDebt > 0) {
             uint256 newCollateral = getActualBalance(msg.sender) - amount;
             require(
@@ -149,7 +152,7 @@ contract AAVE is ERC20 {
     // user    = the BORROWER being liquidated (unhealthy account)
     // msg.sender = the LIQUIDATOR (pays debt, receives collateral
     
-    function liquidate(address user, uint256 repayAmount) external {
+    function liquidate(address user, uint256  ) external {
         updateLiquidityIndex();
         updateBorrowIndex();
         require(getHealthFactor(user) < 1e18, "HF must be below 1"); 
@@ -157,7 +160,8 @@ contract AAVE is ERC20 {
         if (repayAmount > getActualDebt(user)) {
             repayAmount = getActualDebt(user);                      
         }
-
+           
+           
         IERC20(asset).safeTransferFrom(msg.sender, address(this), repayAmount); 
         uint256 scaledRepay= repayAmount*(1e27)/ borrowIndex;
         scaledDebt[user] -= scaledRepay;
@@ -209,6 +213,25 @@ contract AAVE is ERC20 {
     function getActualDebt(address user) public view returns(uint256){
         return (scaledDebt[user] * borrowIndex)/1e27;
 
+    }
+    
+    function flashLoan(uint256 amount , address receiver, bytes calldata data) external {
+        require(amount >0 , "Amount must be greater than 0");
+
+        uint256 balanceBefore = IERC20(asset).balanceOf(address(this));
+        require(balanceBefore >= amount, "Not enough liquidity for flash loan");
+        uint256 fee= amount * FLASH_FEE/ 1e18;
+        IERC20(asset).safeTransfer(receiver, amount);
+
+        uint256 totalRepayment = amount + fee;
+
+        bool success =
+        IFlashLoanReceiver(receiver).executeOperation(asset, amount, fee, msg.sender, data);
+
+        require(success,"Flash loan execution failed");
+        uint256 balanceAfter = IERC20(asset).balanceOf(address(this));
+        require(balanceAfter >= balanceBefore + fee, "Flash loan not repaid with fee");
+        emit FlashLoan(receiver, amount , fee);
     }
 }
 
