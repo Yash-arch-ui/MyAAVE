@@ -3,9 +3,10 @@ pragma solidity ^0.8.19;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "./interface/IFlashLoanReceiver.sol";
 
-contract AAVE is ERC20 {
+contract AAVE is ERC20, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     address public asset;
@@ -43,6 +44,7 @@ contract AAVE is ERC20 {
     event FlashLoan (address indexed receiver , uint256 amount , uint256 fee);
 
     constructor(address token) ERC20("TCoin", "aTC") {
+        require(token != address(0), "Invalid token");
         asset = token;
         lastIndexUpdate = block.timestamp;
         borrowIndex=1e27;
@@ -73,7 +75,7 @@ contract AAVE is ERC20 {
 
    
 
-    function supply(uint256 amount) external {
+    function supply(uint256 amount) external nonReentrant {
 
         updateLiquidityIndex(); // Accrue interest first 
         require(amount > 0, "Amount must be > 0");
@@ -88,7 +90,7 @@ contract AAVE is ERC20 {
         emit Supplied(msg.sender, amount);
     }
 
-    function borrow(uint256 amount) external {
+    function borrow(uint256 amount) external nonReentrant {
         updateLiquidityIndex();
         updateBorrowIndex();
         require(amount > 0, "Amount must be > 0");
@@ -99,20 +101,20 @@ contract AAVE is ERC20 {
         uint256 existingDebt = getActualDebt(msg.sender);
         uint256 maxBorrow = (collateral * LTV) / 100;
         require(existingDebt + amount <= maxBorrow, "Exceeds max borrow");
+        require(totalLiquidity >= totalBorrowed + amount, "Insufficient liquidity");
 
-        require(getHealthFactor(msg.sender) > 1e18, "Health factor too low");
-        require(totalLiquidity - totalBorrowed >= amount, "Insufficient liquidity");
-        uint256 scaledAmount = (amount* 1e27)/ borrowIndex;
+        uint256 scaledAmount = (amount * 1e27) / borrowIndex;
         scaledDebt[msg.sender] += scaledAmount;
         totalBorrowed += amount;
-    
+
+        require(getHealthFactor(msg.sender) > 1e18, "Health factor too low");
 
         IERC20(asset).safeTransfer(msg.sender, amount);
 
         emit Borrow(msg.sender, amount);
     }
 
-    function repay(uint256 amount) external {
+    function repay(uint256 amount) external nonReentrant {
         updateBorrowIndex();
         require(amount > 0, "Amount must be > 0");
         uint256 currentDebt = getActualDebt(msg.sender);
@@ -129,7 +131,7 @@ contract AAVE is ERC20 {
         emit Repay(msg.sender, repayAmount);
     }
 
-    function withdraw(uint256 amount) external {
+    function withdraw(uint256 amount) external nonReentrant {
         updateLiquidityIndex();
 
         require(amount > 0, "Amount must be > 0");
@@ -155,14 +157,16 @@ contract AAVE is ERC20 {
     // user    = the BORROWER being liquidated (unhealthy account)
     // msg.sender = the LIQUIDATOR (pays debt, receives collateral
     
-    function liquidate(address user, uint256 repayAmount) external {
+    function liquidate(address user, uint256 repayAmount) external nonReentrant {
         updateLiquidityIndex();
         updateBorrowIndex();
+        require(user != address(0), "Invalid user");
         require(getHealthFactor(user) < 1e18, "HF must be below 1"); 
 
         if (repayAmount > getActualDebt(user)) {
             repayAmount = getActualDebt(user);                      
         }
+        require(repayAmount > 0, "No debt to repay");
            
            
         IERC20(asset).safeTransferFrom(msg.sender, address(this), repayAmount); 
@@ -218,8 +222,9 @@ contract AAVE is ERC20 {
 
     }
     
-    function flashLoan(uint256 amount , address receiver, bytes calldata data) external {
-        require(amount >0 , "Amount must be greater than 0");
+    function flashLoan(uint256 amount , address receiver, bytes calldata data) external nonReentrant {
+        require(amount > 0, "Amount must be greater than 0");
+        require(receiver != address(0), "Invalid receiver");
 
         uint256 balanceBefore = IERC20(asset).balanceOf(address(this));
         require(balanceBefore >= amount, "Not enough liquidity for flash loan");
