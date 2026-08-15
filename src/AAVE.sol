@@ -17,14 +17,14 @@ contract AAVE is ERC20 {
     uint256 public lastBorrowIndexUpdate;
 
 
-    uint256 public constant OPTIMAL_UTILIZATION = 80e16;
-    uint256 public constant BASE_RATE = 2e16;
-    uint256 public constant SLOPE1 = 5e16;
-    uint256 public constant SLOPE2 = 20e16;
+    uint256 public constant OPTIMAL_UTILIZATION = 80e16;// total utilisation rate 
+    uint256 public constant BASE_RATE = 2e16;// minimum borrow rate
+    uint256 public constant SLOPE1 = 5e16;// rate increase below optimal
+    uint256 public constant SLOPE2 = 20e16;// rate increase ablove optimal
     uint256 public constant FLASH_FEE= 0.09e18;
 
-    uint256 public constant LTV = 75;
-    uint256 public constant LIQUIDATION_THRESHOLD = 80;
+    uint256 public constant LTV = 75;// can borrow upto 75 percent of collateral 
+    uint256 public constant LIQUIDATION_THRESHOLD = 80;// account is liquidatable if debt > 80% of collateral
 
     mapping(address => uint256) public userBorrowings;
     mapping(address => uint256) public scaledBalances;
@@ -55,6 +55,7 @@ contract AAVE is ERC20 {
         if(timeElapsed == 0) return;
 
         uint256 rate = getBorrowRate();
+        // Simple interest : index griws proprotionally to rate and time 
         uint256 interest= (borrowIndex* rate * timeElapsed) / (365 days * 1e18);
         borrowIndex += interest;
         lastBorrowIndexUpdate = block.timestamp;
@@ -67,20 +68,22 @@ contract AAVE is ERC20 {
         uint256 interest = (liquidityIndex * rate * timeElapsed) / (365 days * 1e18);
         liquidityIndex += interest;
         lastIndexUpdate = block.timestamp;
+        // how much did 1 token grow since last time someone touched the pool"
     }
 
    
 
     function supply(uint256 amount) external {
 
-        updateLiquidityIndex();
+        updateLiquidityIndex(); // Accrue interest first 
         require(amount > 0, "Amount must be > 0");
-        IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
+        IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);// Pull token
         totalLiquidity += amount;
 
-        uint256 scaledAmount = (amount * 1e27) / liquidityIndex;
-        scaledBalances[msg.sender] += scaledAmount;
-        _mint(msg.sender, scaledAmount);
+        uint256 scaledAmount = (amount * 1e27) / liquidityIndex; // divided by index 
+        scaledBalances[msg.sender] += scaledAmount; 
+
+        _mint(msg.sender, scaledAmount);// mint aTokens as recipt
 
         emit Supplied(msg.sender, amount);
     }
@@ -90,7 +93,7 @@ contract AAVE is ERC20 {
         updateBorrowIndex();
         require(amount > 0, "Amount must be > 0");
 
-        uint256 collateral = getActualBalance(msg.sender);
+        uint256 collateral = getActualBalance(msg.sender); // your deposited value 
         require(collateral > 0, "No collateral");
 
         uint256 existingDebt = getActualDebt(msg.sender);
@@ -152,7 +155,7 @@ contract AAVE is ERC20 {
     // user    = the BORROWER being liquidated (unhealthy account)
     // msg.sender = the LIQUIDATOR (pays debt, receives collateral
     
-    function liquidate(address user, uint256  ) external {
+    function liquidate(address user, uint256 repayAmount) external {
         updateLiquidityIndex();
         updateBorrowIndex();
         require(getHealthFactor(user) < 1e18, "HF must be below 1"); 
