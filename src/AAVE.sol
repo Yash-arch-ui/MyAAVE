@@ -17,20 +17,22 @@ contract AAVE is ERC20, ReentrancyGuard {
     uint256 public borrowIndex;
     uint256 public lastBorrowIndexUpdate;
 
+    uint256 public constant OPTIMAL_UTILIZATION = 80e16; // total utilisation rate
+    uint256 public constant BASE_RATE = 2e16;             // minimum borrow rate
+    uint256 public constant SLOPE1 = 5e16;                // rate increase below optimal
+    uint256 public constant SLOPE2 = 20e16;                // rate increase above optimal
+    uint256 public constant FLASH_FEE = 0.09e18;
 
-    uint256 public constant OPTIMAL_UTILIZATION = 80e16;// total utilisation rate 
-    uint256 public constant BASE_RATE = 2e16;// minimum borrow rate
-    uint256 public constant SLOPE1 = 5e16;// rate increase below optimal
-    uint256 public constant SLOPE2 = 20e16;// rate increase ablove optimal
-    uint256 public constant FLASH_FEE= 0.09e18;
+    // FIX: was missing entirely — required by updateLiquidityIndex().
+    // Protocol takes 10% of borrower interest into reserves before it reaches suppliers.
+    uint256 public constant RESERVE_FACTOR = 10e16; // 10%, WAD-scaled
 
-    uint256 public constant LTV = 75;// can borrow upto 75 percent of collateral 
-    uint256 public constant LIQUIDATION_THRESHOLD = 80;// account is liquidatable if debt > 80% of collateral
+    uint256 public constant LTV = 75;                    // can borrow up to 75% of collateral
+    uint256 public constant LIQUIDATION_THRESHOLD = 80;  // liquidatable if debt > 80% of collateral
 
     mapping(address => uint256) public userBorrowings;
     mapping(address => uint256) public scaledBalances;
     mapping(address => uint256) public scaledDebt;
-
 
     event Supplied(address indexed user, uint256 amount);
     event Borrow(address indexed user, uint256 amount);
@@ -41,51 +43,53 @@ contract AAVE is ERC20, ReentrancyGuard {
         uint256 repayAmount,
         uint256 collateralGiven
     );
-    event FlashLoan (address indexed receiver , uint256 amount , uint256 fee);
+    event FlashLoan(address indexed receiver, uint256 amount, uint256 fee);
 
     constructor(address token) ERC20("TCoin", "aTC") {
         require(token != address(0), "Invalid token");
         asset = token;
+        borrowIndex = 1e27;
+        liquidityIndex = 1e27;
         lastIndexUpdate = block.timestamp;
-        borrowIndex=1e27;
-        liquidityIndex=1e27;
-        lastIndexUpdate= block.timestamp;
-        lastBorrowIndexUpdate= block.timestamp;
+        lastBorrowIndexUpdate = block.timestamp;
     }
-     function updateBorrowIndex() internal{
-        uint256 timeElapsed= block.timestamp - lastBorrowIndexUpdate;
-        if(timeElapsed == 0) return;
+
+    function updateBorrowIndex() internal {
+        uint256 timeElapsed = block.timestamp - lastBorrowIndexUpdate;
+        if (timeElapsed == 0) return;
 
         uint256 rate = getBorrowRate();
-        // Simple interest : index griws proprotionally to rate and time 
-        uint256 interest= (borrowIndex* rate * timeElapsed) / (365 days * 1e18);
+        // Simple interest: index grows proportionally to rate and time.
+        uint256 interest = (borrowIndex * rate * timeElapsed) / (365 days * 1e18);
         borrowIndex += interest;
         lastBorrowIndexUpdate = block.timestamp;
-     }
+    }
+
     function updateLiquidityIndex() internal {
         uint256 timeElapsed = block.timestamp - lastIndexUpdate;
         if (timeElapsed == 0) return;
 
-        uint256 rate = getBorrowRate();
-        uint256 interest = (liquidityIndex * rate * timeElapsed) / (365 days * 1e18);
+        uint256 borrowRate = getBorrowRate();
+        // FIX: suppliers only earn on the utilized fraction of the pool, not the full borrow rate.
+        uint256 utilization = totalLiquidity == 0 ? 0 : (totalBorrowed * 1e18) / totalLiquidity;
+        // FIX: protocol skims RESERVE_FACTOR before interest reaches suppliers.
+        uint256 supplyRate = (borrowRate * utilization / 1e18) * (1e18 - RESERVE_FACTOR) / 1e18;
+
+        uint256 interest = (liquidityIndex * supplyRate * timeElapsed) / (365 days * 1e18);
         liquidityIndex += interest;
         lastIndexUpdate = block.timestamp;
-        // how much did 1 token grow since last time someone touched the pool"
     }
 
-   
-
     function supply(uint256 amount) external nonReentrant {
-
-        updateLiquidityIndex(); // Accrue interest first 
+        updateLiquidityIndex(); // Accrue interest first
         require(amount > 0, "Amount must be > 0");
-        IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);// Pull token
+        IERC20(asset).safeTransferFrom(msg.sender, address(this), amount); // Pull token
         totalLiquidity += amount;
 
-        uint256 scaledAmount = (amount * 1e27) / liquidityIndex; // divided by index 
-        scaledBalances[msg.sender] += scaledAmount; 
+        uint256 scaledAmount = (amount * 1e27) / liquidityIndex; // divided by index
+        scaledBalances[msg.sender] += scaledAmount;
 
-        _mint(msg.sender, scaledAmount);// mint aTokens as recipt
+        _mint(msg.sender, scaledAmount); // mint aTokens as receipt
 
         emit Supplied(msg.sender, amount);
     }
@@ -95,7 +99,7 @@ contract AAVE is ERC20, ReentrancyGuard {
         updateBorrowIndex();
         require(amount > 0, "Amount must be > 0");
 
-        uint256 collateral = getActualBalance(msg.sender); // your deposited value 
+        uint256 collateral = getActualBalance(msg.sender); // your deposited value
         require(collateral > 0, "No collateral");
 
         uint256 existingDebt = getActualDebt(msg.sender);
@@ -115,6 +119,9 @@ contract AAVE is ERC20, ReentrancyGuard {
     }
 
     function repay(uint256 amount) external nonReentrant {
+        // FIX: liquidityIndex must accrue based on utilization BEFORE totalBorrowed/totalLiquidity
+        // change, otherwise suppliers lose the interest earned up to this moment.
+        updateLiquidityIndex();
         updateBorrowIndex();
         require(amount > 0, "Amount must be > 0");
         uint256 currentDebt = getActualDebt(msg.sender);
@@ -123,8 +130,8 @@ contract AAVE is ERC20, ReentrancyGuard {
         uint256 repayAmount = amount > currentDebt ? currentDebt : amount;
 
         IERC20(asset).safeTransferFrom(msg.sender, address(this), repayAmount);
-        uint256 scaledAmount= (repayAmount*1e27)/ borrowIndex;
-       scaledDebt[msg.sender] -= scaledAmount;
+        uint256 scaledAmount = (repayAmount * 1e27) / borrowIndex;
+        scaledDebt[msg.sender] -= scaledAmount;
         totalBorrowed -= repayAmount;
         totalLiquidity += repayAmount;
 
@@ -137,7 +144,7 @@ contract AAVE is ERC20, ReentrancyGuard {
         require(amount > 0, "Amount must be > 0");
         require(getActualBalance(msg.sender) >= amount, "Insufficient balance");
         uint256 currentDebt = getActualDebt(msg.sender);
-        
+
         if (currentDebt > 0) {
             uint256 newCollateral = getActualBalance(msg.sender) - amount;
             require(
@@ -154,38 +161,36 @@ contract AAVE is ERC20, ReentrancyGuard {
         IERC20(asset).safeTransfer(msg.sender, amount);
     }
 
-    // user    = the BORROWER being liquidated (unhealthy account)
-    // msg.sender = the LIQUIDATOR (pays debt, receives collateral
-    
+    // user       = the BORROWER being liquidated (unhealthy account)
+    // msg.sender = the LIQUIDATOR (pays debt, receives collateral)
     function liquidate(address user, uint256 repayAmount) external nonReentrant {
         updateLiquidityIndex();
         updateBorrowIndex();
         require(user != address(0), "Invalid user");
-        require(getHealthFactor(user) < 1e18, "HF must be below 1"); 
+        require(getHealthFactor(user) < 1e18, "HF must be below 1");
 
         if (repayAmount > getActualDebt(user)) {
-            repayAmount = getActualDebt(user);                      
+            repayAmount = getActualDebt(user);
         }
         require(repayAmount > 0, "No debt to repay");
-           
-           
-        IERC20(asset).safeTransferFrom(msg.sender, address(this), repayAmount); 
-        uint256 scaledRepay= repayAmount*(1e27)/ borrowIndex;
+
+        IERC20(asset).safeTransferFrom(msg.sender, address(this), repayAmount);
+        uint256 scaledRepay = repayAmount * 1e27 / borrowIndex;
         scaledDebt[user] -= scaledRepay;
 
         totalBorrowed -= repayAmount;
-        uint256 collateralToGive = (repayAmount * 110) / 100;         
-        uint256 actualBalance = getActualBalance(user);               
+        uint256 collateralToGive = (repayAmount * 110) / 100;
+        uint256 actualBalance = getActualBalance(user);
         if (collateralToGive > actualBalance) {
             collateralToGive = actualBalance;
         }
 
         uint256 scaledToRemove = (collateralToGive * 1e27) / liquidityIndex;
-        scaledBalances[user] -= scaledToRemove;                       
+        scaledBalances[user] -= scaledToRemove;
         totalLiquidity -= collateralToGive;
 
-        _burn(user, scaledToRemove);                                   
-        IERC20(asset).safeTransfer(msg.sender, collateralToGive);      
+        _burn(user, scaledToRemove);
+        IERC20(asset).safeTransfer(msg.sender, collateralToGive);
 
         emit Liquidated(user, msg.sender, repayAmount, collateralToGive);
     }
@@ -212,34 +217,29 @@ contract AAVE is ERC20, ReentrancyGuard {
         return (collateral * LIQUIDATION_THRESHOLD * 1e18) / (debt * 100);
     }
 
- 
     function getActualBalance(address user) public view returns (uint256) {
         return (scaledBalances[user] * liquidityIndex) / 1e27;
     }
 
-    function getActualDebt(address user) public view returns(uint256){
-        return (scaledDebt[user] * borrowIndex)/1e27;
-
+    function getActualDebt(address user) public view returns (uint256) {
+        return (scaledDebt[user] * borrowIndex) / 1e27;
     }
-    
-    function flashLoan(uint256 amount , address receiver, bytes calldata data) external nonReentrant {
+
+    function flashLoan(uint256 amount, address receiver, bytes calldata data) external nonReentrant {
         require(amount > 0, "Amount must be greater than 0");
         require(receiver != address(0), "Invalid receiver");
 
         uint256 balanceBefore = IERC20(asset).balanceOf(address(this));
         require(balanceBefore >= amount, "Not enough liquidity for flash loan");
-        uint256 fee= amount * FLASH_FEE/ 1e18;
+        uint256 fee = amount * FLASH_FEE / 1e18;
         IERC20(asset).safeTransfer(receiver, amount);
 
-        uint256 totalRepayment = amount + fee;
-
         bool success =
-        IFlashLoanReceiver(receiver).executeOperation(asset, amount, fee, msg.sender, data);
+            IFlashLoanReceiver(receiver).executeOperation(asset, amount, fee, msg.sender, data);
 
-        require(success,"Flash loan execution failed");
+        require(success, "Flash loan execution failed");
         uint256 balanceAfter = IERC20(asset).balanceOf(address(this));
         require(balanceAfter >= balanceBefore + fee, "Flash loan not repaid with fee");
-        emit FlashLoan(receiver, amount , fee);
+        emit FlashLoan(receiver, amount, fee);
     }
 }
-
